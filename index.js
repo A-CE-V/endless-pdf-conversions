@@ -93,7 +93,7 @@ app.post(
         width: 0,
         height: 0,
         saveFilename: "page",
-        savePath: outputDirm,
+        savePath: outputDir,
         graphicsProcess: "gm"
       };
 
