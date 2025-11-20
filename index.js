@@ -93,7 +93,8 @@ app.post(
         width: 0,
         height: 0,
         saveFilename: "page",
-        savePath: outputDir
+        savePath: outputDirm,
+        graphicsProcess: "gm"
       };
 
       const converter = fromBuffer(req.file.buffer, options);
