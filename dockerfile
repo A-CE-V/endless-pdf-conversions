@@ -1,34 +1,26 @@
-# Use a lightweight Node image
-FROM node:20-bullseye-slim
+# Use the FULL bullseye image (not slim) to ensure all shared libs are present
+FROM node:20-bullseye
 
-# Install system dependencies required for image processing and native module compilation
+# Install dependencies
+# 'ghostscript' and 'graphicsmagick' are the core requirements
 RUN apt-get update && apt-get install -y \
-    # Core PDF/Image tools
     graphicsmagick \
     ghostscript \
     poppler-utils \
-    # Development libraries for graphics (sharp/native modules)
-    libcairo2-dev \
-    libpango1.0-dev \
-    libjpeg-dev \
-    libgif-dev \
-    librsvg2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Fix for OpenSSL/Ghostscript policy issues (common in Docker)
+# This allows Ghostscript to read files it might otherwise block
+RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true
+
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
 
-# Install Node dependencies
 RUN npm ci --only=production
 
-# Copy the rest of the app
 COPY . .
 
-# Expose the port
 EXPOSE 3000
 
-# Start the application
 CMD ["node", "index.js"]

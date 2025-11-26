@@ -7,37 +7,42 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from 'url';
 import pLimit from "p-limit";
-import { fromBuffer } from "pdf2pic"; // Use fromBuffer
-// Shared imports (Keep your existing imports)
+import { fromPath } from "pdf2pic"; // Revert to fromPath (it is more stable)
+
+// Shared imports
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// 1. SETUP DISK STORAGE TO SAVE RAM
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+// 1. USE SYSTEM TEMP DIRECTORY FOR UPLOADS (Better for Docker)
+// On Linux/Docker, os.tmpdir() is usually '/tmp'
+import os from "os";
+const TEMP_DIR = os.tmpdir();
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, uploadDir);
+    cb(null, TEMP_DIR);
   },
   filename: function (req, file, cb) {
+    // Simple safe filename
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    cb(null, 'upload-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
 const upload = multer({ storage: storage });
 app.use(express.json());
 
-// Helper to delete files
-const cleanupFiles = (files) => {
-    if (!files) return;
-    const fileArray = Array.isArray(files) ? files : [files];
-    fileArray.forEach(f => {
-        if (f.path && fs.existsSync(f.path)) fs.unlinkSync(f.path);
+// Helper to delete files safely
+const cleanupFiles = (paths) => {
+    if (!paths) return;
+    const pathArray = Array.isArray(paths) ? paths : [paths];
+    pathArray.forEach(p => {
+        try {
+            if (p && fs.existsSync(p)) fs.unlinkSync(p);
+        } catch (e) { console.error("Cleanup warning:", e.message); }
     });
 };
 
@@ -91,25 +96,21 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
 
 // --------------------- PDF → IMAGE ---------------------
 app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
-    // We still need a temporary directory for pdf2pic's output files
-    const outputDir = path.join(__dirname, "conversion_output_" + Date.now());
+    // Create a unique subfolder in /tmp for this request's outputs
+    const requestOutputId = "conversion_" + Date.now();
+    const outputDir = path.join(TEMP_DIR, requestOutputId);
     
-    // Declare pdfBuffer here to ensure it's available in finally
-    let pdfBuffer;
-    let filePath; // Store the path to clean up later
+    let uploadedFilePath = null;
 
     try {
         if (!req.file) return res.status(400).json({ error: "Upload a PDF" });
 
-        filePath = req.file.path; // Save path before reading
-        
-        // 1. READ FILE AND IMMEDIATELY CLEAN UP THE UPLOADED FILE
-        pdfBuffer = fs.readFileSync(filePath);
-        cleanupFiles(req.file); // <-- DELETE THE UPLOADED FILE NOW!
+        uploadedFilePath = req.file.path; // This is now in /tmp/upload-....pdf
 
         const format = (req.body.format || "png").toLowerCase();
         const dpi = parseInt(req.body.dpi) || 150;
 
+        // Ensure output directory exists
         if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
         const options = {
@@ -121,30 +122,38 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
             graphicsProcess: "gm"
         };
 
-        // 2. Use fromBuffer with the buffer we already read
-        const converter = fromBuffer(pdfBuffer, options); 
+        // 1. Initialize converter pointing to the file on disk
+        const converter = fromPath(uploadedFilePath, options);
         
-        // Use the buffer to get the page count
+        // 2. Load PDF to get page count
+        // Note: loading from disk is memory efficient
+        const pdfBuffer = fs.readFileSync(uploadedFilePath);
         const pdfDoc = await PDFDocument.load(pdfBuffer);
         const pageCount = pdfDoc.getPageCount();
-        
-        // ... (rest of the logic remains the same) ...
 
-        const limit = pLimit(2); 
+        // 3. CRITICAL: Set Limit to 1 for Free Tier
+        // Rendering PDF to Image is heavy. Doing 2 at once might kill the 512MB RAM.
+        const limit = pLimit(1); 
+        
         const pageIndices = Array.from({ length: pageCount }, (_, i) => i + 1);
 
         const tasks = pageIndices.map((i) => {
             return limit(async () => {
-                // responseType: "base64" is required when using fromBuffer
-                const result = await converter(i, { responseType: "base64" }); 
-                if (!result.base64) throw new Error(`Failed page ${i}`);
+                // Return base64 so we don't have to read the file back from disk manually
+                const result = await converter(i, { responseType: "base64" });
+                
+                // Detailed error checking
+                if (!result || !result.base64) {
+                    console.error(`Page ${i} failed. Result:`, result);
+                    throw new Error(`Failed to convert page ${i}`);
+                }
                 return result;
             });
         });
 
         const results = await Promise.all(tasks);
 
-        // ... (Send images or ZIP logic) ...
+        // ... Response Logic ...
         if (results.length === 1) {
             const base64Data = results[0].base64;
             res.setHeader("Content-Type", `image/${format}`);
@@ -163,17 +172,19 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
         }
 
     } catch (err) {
-        console.error(err);
-        // If the error happens before cleanupFiles(req.file) is called, 
-        // we clean up the file here just in case.
-        if (filePath) cleanupFiles({ path: filePath }); 
+        console.error("Conversion Error:", err);
         res.status(500).json({ error: err.message });
     } finally {
-        // CLEANUP: Only need to delete the output directory now
+        // CLEANUP
         try {
-            if (fs.existsSync(outputDir)) fs.rmSync(outputDir, { recursive: true, force: true });
-            // cleanupFiles(req.file) is no longer here, preventing the ENOENT error.
-        } catch (e) { console.error("Output cleanup error", e); }
+            // Delete the uploaded PDF
+            if (uploadedFilePath) cleanupFiles(uploadedFilePath);
+            
+            // Delete the output folder and its contents
+            if (fs.existsSync(outputDir)) {
+                fs.rmSync(outputDir, { recursive: true, force: true });
+            }
+        } catch (e) { console.error("Final cleanup error", e); }
     }
 });
 
