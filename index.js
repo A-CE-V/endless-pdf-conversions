@@ -8,7 +8,7 @@ import path from "path";
 import { fileURLToPath } from 'url';
 import pLimit from "p-limit";
 import os from "os";
-import pdf from "pdf-to-img";
+import {pdf} from "pdf-to-img";
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
 
