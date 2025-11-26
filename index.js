@@ -110,13 +110,13 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
         const dpi = parseInt(req.body.dpi) || 150;
 
         // 2. Configure pdf-to-img
-        const converter = pdf.toImg(uploadedFilePath, {
-            // pdf-to-img uses 'quality' to set the DPI/resolution
-            quality: dpi, 
-            format: safeFormat, 
-            outputDir: outputDir,
-            outputName: 'page'   // Files will be named page-1.jpg, page-2.jpg, etc.
+        const converter = pdf(uploadedFilePath).toImage({
+            quality: dpi,
+            type: safeFormat,     // IMPORTANT: "type", not "format"
+            outputDir,
+            outputName: "page"
         });
+
         
         console.log(`Starting conversion using pdf-to-img at ${dpi} DPI...`);
 
