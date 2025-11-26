@@ -11,11 +11,11 @@ import os from "os";
 import {pdf} from "pdf-to-img";
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
+import { PDFiumLibrary } from "@hyzyla/pdfium";
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-
-// USE SYSTEM TEMP DIRECTORY
 const TEMP_DIR = os.tmpdir();
 
 const storage = multer.diskStorage({
@@ -41,6 +41,13 @@ const cleanupFiles = (paths) => {
         } catch (e) { console.error("Cleanup warning:", e.message); }
     });
 };
+
+let pdfium = null;
+// init PDFium once
+(async () => {
+  pdfium = await PDFiumLibrary.init();
+  console.log("PDFium initialized");
+})();
 
 // --------------------- IMAGE → PDF ---------------------
 // (Your existing code for Image to PDF remains exactly the same)
@@ -89,7 +96,7 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
 });
 
 // --------------------- PDF → IMAGE (Rewritten with pdf-to-img) ---------------------
-app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
+app.post("/pdf/v1/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
     const requestOutputId = "conversion_" + Date.now();
     const outputDir = path.join(TEMP_DIR, requestOutputId);
 
@@ -182,6 +189,89 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
             console.error("Final cleanup error", e);
         }
     }
+});
+
+app.post("/pdf/v2/pdf-to-image/", upload.single("pdf"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "Upload a PDF file" });
+  }
+
+  const format = (req.body.format || "png").toLowerCase();
+  const outFormat = format === "jpeg" ? "jpeg" : format;
+  const ext = outFormat === "jpeg" ? "jpg" : outFormat;
+
+  const scale = parseFloat(req.body.scale || req.body.dpi) || 1;
+  const concurrency = Math.max(1, (os.cpus().length || 2) - 1);
+
+  try {
+    const pdfBuffer = await fs.promises.readFile(req.file.path);
+    const doc = await pdfium.loadDocument(pdfBuffer /*, password if needed */);
+
+    const pages = [...doc.pages()];
+    if (pages.length === 0) throw new Error("PDF has no pages");
+
+    // Prepare ZIP or single image
+    const multiple = pages.length > 1;
+    if (multiple) {
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Disposition", `attachment; filename="pages.zip"`);
+    }
+
+    const archive = multiple ? archiver("zip", { zlib: { level: 6 } }) : null;
+    if (archive) archive.pipe(res);
+
+    const limit = pLimit(concurrency);
+
+    const tasks = pages.map((page, idx) =>
+      limit(async () => {
+        const pageNumber = page.number;
+
+        // Render page to raw bitmap via PDFium + sharp
+        const rendered = await page.render({
+          scale,
+          render: async (options) => {
+            // options.data is RGBA raw bitmap, options.width/height available
+            return sharp(options.data, {
+              raw: { width: options.width, height: options.height, channels: 4 }
+            })
+              .toFormat(outFormat)
+              .toBuffer();
+          },
+        });
+
+        const buffer = Buffer.from(rendered.data); // rendered.data is Uint8Array
+
+        const filename = multiple
+          ? `page_${pageNumber}.${ext}`
+          : `page1.${ext}`;
+
+        if (multiple) {
+          archive.append(buffer, { name: filename });
+        } else {
+          res.setHeader("Content-Type", `image/${ext}`);
+          res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+          res.send(buffer);
+        }
+      })
+    );
+
+    await Promise.all(tasks);
+
+    if (multiple) {
+      await archive.finalize();
+    }
+
+    // cleanup
+    await fs.promises.unlink(req.file.path);
+    doc.destroy();
+  } catch (err) {
+    console.error("PDF‑v2 conversion error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Conversion failed", details: err.message });
+    } else {
+      try { res.end(); } catch (_) {}
+    }
+  }
 });
 
 

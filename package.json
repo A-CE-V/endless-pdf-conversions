@@ -7,6 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@hyzyla/pdfium": "^2.1.9",
     "archiver": "^7.0.1",
     "cors": "^2.8.5",
     "express": "^5.1.0",
