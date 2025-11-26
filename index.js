@@ -10,7 +10,7 @@ import pLimit from "p-limit";
 import os from "os";
 import { exec } from "child_process";
 import { promisify } from "util";
-
+import pdf from "pdf-to-img";
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
 
@@ -91,9 +91,8 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
     }
 });
 
-// --------------------- PDF → IMAGE ---------------------
+// --------------------- PDF → IMAGE (Final Version with 3-Minute Timeout) ---------------------
 app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
-    // 1. Setup Output Directory
     const requestOutputId = "conversion_" + Date.now();
     const outputDir = path.join(TEMP_DIR, requestOutputId);
     
@@ -104,39 +103,35 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
 
         uploadedFilePath = req.file.path;
         
+        // Ensure output directory exists
         if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
         const format = (req.body.format || "png").toLowerCase();
         // pdftocairo format names: png, jpeg, tiff, pdf, ps, eps, svg
         const safeFormat = format === "jpg" ? "jpeg" : format;
-        const dpi = parseInt(req.body.dpi) || 150;
+        const dpi = parseInt(req.body.dpi) || 150; // Keep 150 DPI as default for quality
         
         // Output file prefix for pdftocairo (creates file-1.png, file-2.png, etc.)
         const outputPrefix = path.join(outputDir, "page");
 
         // 2. Build the pdftocairo command
-        // -r {dpi} sets the resolution
-        // -{format} sets the output format
         const command = `pdftocairo -r ${dpi} -${safeFormat} ${uploadedFilePath} ${outputPrefix}`;
         
         console.log(`Executing: ${command}`);
 
         // 3. Execute Conversion
-        // The Poppler binary should now run directly
+        // IMPORTANT: Increased timeout to 180 seconds (3 minutes) for complex PDFs
         const { stdout, stderr } = await execPromise(command, { 
-            // Give it more time, especially on Free Tier
-            timeout: 60000 
+            timeout: 180000 // 180 seconds
         });
 
         if (stderr) {
             console.error("pdftocairo STDERR:", stderr);
-            // Even if there's stderr, the conversion might succeed, so we continue.
+            // Conversion often succeeds despite warnings, so we continue.
         }
 
-        // 4. Read the generated files
         const files = await fs.promises.readdir(outputDir);
         
-        // Filter only valid image files
         const imageFiles = files.filter(file => file.endsWith(`.${safeFormat}`));
 
         if (imageFiles.length === 0) {
@@ -178,9 +173,15 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
     } catch (err) {
         // Log the full error from the shell command
         console.error("pdftocairo Conversion Error:", err.message);
+        // Check if the error is due to timeout
+        let message = err.message;
+        if (err.message && err.message.includes('ETIMEDOUT') || err.message.includes('timed out')) {
+            message = "Conversion timed out. The PDF may be too complex or large for the server's resources.";
+        }
+        
         res.status(500).json({ 
             error: "Conversion failed. Binary execution error.", 
-            details: err.message 
+            details: message 
         });
     } finally {
         // CLEANUP
