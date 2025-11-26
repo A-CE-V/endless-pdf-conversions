@@ -8,8 +8,6 @@ import path from "path";
 import { fileURLToPath } from 'url';
 import pLimit from "p-limit";
 import os from "os";
-import { exec } from "child_process";
-import { promisify } from "util";
 import pdf from "pdf-to-img";
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
@@ -19,7 +17,6 @@ const app = express();
 
 // USE SYSTEM TEMP DIRECTORY
 const TEMP_DIR = os.tmpdir();
-const execPromise = promisify(exec);
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -91,8 +88,9 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
     }
 });
 
-// --------------------- PDF → IMAGE (Final Version with 3-Minute Timeout) ---------------------
+// --------------------- PDF → IMAGE (Rewritten with pdf-to-img) ---------------------
 app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
+    // 1. Setup Output Directory
     const requestOutputId = "conversion_" + Date.now();
     const outputDir = path.join(TEMP_DIR, requestOutputId);
     
@@ -107,52 +105,56 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
         if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
         const format = (req.body.format || "png").toLowerCase();
-        // pdftocairo format names: png, jpeg, tiff, pdf, ps, eps, svg
-        const safeFormat = format === "jpg" ? "jpeg" : format;
-        const dpi = parseInt(req.body.dpi) || 150; // Keep 150 DPI as default for quality
-        
-        // Output file prefix for pdftocairo (creates file-1.png, file-2.png, etc.)
-        const outputPrefix = path.join(outputDir, "page");
+        // pdf-to-img uses 'jpg' instead of 'jpeg' for consistency
+        const safeFormat = format === "jpeg" ? "jpg" : format;
+        const dpi = parseInt(req.body.dpi) || 150;
 
-        // 2. Build the pdftocairo command
-        const command = `pdftocairo -r ${dpi} -${safeFormat} ${uploadedFilePath} ${outputPrefix}`;
-        
-        console.log(`Executing: ${command}`);
-
-        // 3. Execute Conversion
-        // IMPORTANT: Increased timeout to 180 seconds (3 minutes) for complex PDFs
-        const { stdout, stderr } = await execPromise(command, { 
-            timeout: 180000 // 180 seconds
+        // 2. Configure pdf-to-img
+        const converter = pdf.toImg(uploadedFilePath, {
+            // pdf-to-img uses 'quality' to set the DPI/resolution
+            quality: dpi, 
+            format: safeFormat, 
+            outputDir: outputDir,
+            outputName: 'page'   // Files will be named page-1.jpg, page-2.jpg, etc.
         });
+        
+        console.log(`Starting conversion using pdf-to-img at ${dpi} DPI...`);
 
-        if (stderr) {
-            console.error("pdftocairo STDERR:", stderr);
-            // Conversion often succeeds despite warnings, so we continue.
+        // 3. Execute Conversion using the asynchronous generator
+        // This loop ensures the conversion processes every page.
+        // NOTE: pdf-to-img does not have a built-in timeout like execPromise did.
+        for await (const data of converter) {
+            // Data is the path to the generated image; we just need the loop to run.
         }
 
+        // 4. Read the generated files
         const files = await fs.promises.readdir(outputDir);
         
+        // Filter only valid image files
         const imageFiles = files.filter(file => file.endsWith(`.${safeFormat}`));
 
         if (imageFiles.length === 0) {
-            throw new Error(`pdftocairo failed to generate ${safeFormat} images. Check logs for Poppler errors.`);
+            throw new Error(`pdf-to-img failed to generate ${safeFormat} images. Check logs for Poppler errors.`);
         }
 
-        // 5. SORT FILES NUMERICALLY (pdftocairo appends -01, -02, etc.)
+        // 5. SORT FILES NUMERICALLY 
         imageFiles.sort((a, b) => {
-            // Extracts the number part, e.g., 'page-001.png' -> 1
+            // Extracts the number part, e.g., 'page-1.png' -> 1
             const numA = parseInt(a.match(/page-(\d+)\./)[1]);
             const numB = parseInt(b.match(/page-(\d+)\./)[1]);
             return numA - numB;
         });
 
-        // 6. Send Response (ZIP logic unchanged)
+        // 6. Send Response (ZIP logic is the same)
+        // Note: We use the *original* requested format name in the filename header
+        const outputFilenameFormat = format === "jpeg" ? "jpg" : format;
+
         if (imageFiles.length === 1) {
             const filePath = path.join(outputDir, imageFiles[0]);
             const fileBuffer = await fs.promises.readFile(filePath);
             
             res.setHeader("Content-Type", `image/${safeFormat}`);
-            res.setHeader("Content-Disposition", `attachment; filename="page1.${format}"`);
+            res.setHeader("Content-Disposition", `attachment; filename="page1.${outputFilenameFormat}"`);
             res.send(fileBuffer);
         } else {
             const archive = archiver("zip", { zlib: { level: 1 } });
@@ -164,24 +166,17 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
             for (const [index, fileName] of imageFiles.entries()) {
                 const filePath = path.join(outputDir, fileName);
                 const fileBuffer = await fs.promises.readFile(filePath);
-                archive.append(fileBuffer, { name: `page_${index + 1}.${format}` });
+                archive.append(fileBuffer, { name: `page_${index + 1}.${outputFilenameFormat}` });
             }
             
             await archive.finalize();
         }
 
     } catch (err) {
-        // Log the full error from the shell command
-        console.error("pdftocairo Conversion Error:", err.message);
-        // Check if the error is due to timeout
-        let message = err.message;
-        if (err.message && err.message.includes('ETIMEDOUT') || err.message.includes('timed out')) {
-            message = "Conversion timed out. The PDF may be too complex or large for the server's resources.";
-        }
-        
+        console.error("PDF to Image Conversion Error (pdf-to-img):", err.message);
         res.status(500).json({ 
-            error: "Conversion failed. Binary execution error.", 
-            details: message 
+            error: "Conversion failed. Check logs for details.", 
+            details: err.message 
         });
     } finally {
         // CLEANUP
