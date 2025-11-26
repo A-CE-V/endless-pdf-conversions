@@ -3,12 +3,11 @@ import multer from "multer";
 import { PDFDocument } from "pdf-lib";
 import sharp from "sharp";
 import archiver from "archiver";
-import { fromPath } from "pdf2pic"; // CHANGED: Use fromPath instead of fromBuffer
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from 'url';
 import pLimit from "p-limit";
-
+import { fromBuffer } from "pdf2pic"; // Use fromBuffer
 // Shared imports (Keep your existing imports)
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
 import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
@@ -92,72 +91,89 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
 
 // --------------------- PDF → IMAGE ---------------------
 app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
+    // We still need a temporary directory for pdf2pic's output files
     const outputDir = path.join(__dirname, "conversion_output_" + Date.now());
     
+    // Declare pdfBuffer here to ensure it's available in finally
+    let pdfBuffer;
+    let filePath; // Store the path to clean up later
+
     try {
-      if (!req.file) return res.status(400).json({ error: "Upload a PDF" });
+        if (!req.file) return res.status(400).json({ error: "Upload a PDF" });
 
-      const format = (req.body.format || "png").toLowerCase();
-      const dpi = parseInt(req.body.dpi) || 150;
+        filePath = req.file.path; // Save path before reading
+        
+        // 1. READ FILE AND IMMEDIATELY CLEAN UP THE UPLOADED FILE
+        pdfBuffer = fs.readFileSync(filePath);
+        cleanupFiles(req.file); // <-- DELETE THE UPLOADED FILE NOW!
 
-      if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+        const format = (req.body.format || "png").toLowerCase();
+        const dpi = parseInt(req.body.dpi) || 150;
 
-      const options = {
-        density: dpi,
-        format: format === "jpg" ? "jpeg" : format,
-        saveFilename: "page",
-        savePath: outputDir,
-        width: 0, height: 0,
-        graphicsProcess: "gm" // Ensure this matches what we installed in Docker
-      };
+        if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-      // CHANGED: Use fromPath (reading the file uploaded by Multer)
-      const converter = fromPath(req.file.path, options);
-      
-      // Load PDF just to get page count (load only headers if possible, but load() is okay with files on disk)
-      // Note: We use fs.readFileSync because pdf-lib needs buffer or arraybuffer
-      const pdfBuffer = fs.readFileSync(req.file.path);
-      const pdfDoc = await PDFDocument.load(pdfBuffer);
-      const pageCount = pdfDoc.getPageCount();
+        const options = {
+            density: dpi,
+            format: format === "jpg" ? "jpeg" : format,
+            saveFilename: "page",
+            savePath: outputDir,
+            width: 0, height: 0,
+            graphicsProcess: "gm"
+        };
 
-      const limit = pLimit(2); // Strict limit for low-RAM environments
-      const pageIndices = Array.from({ length: pageCount }, (_, i) => i + 1);
+        // 2. Use fromBuffer with the buffer we already read
+        const converter = fromBuffer(pdfBuffer, options); 
+        
+        // Use the buffer to get the page count
+        const pdfDoc = await PDFDocument.load(pdfBuffer);
+        const pageCount = pdfDoc.getPageCount();
+        
+        // ... (rest of the logic remains the same) ...
 
-      const tasks = pageIndices.map((i) => {
-        return limit(async () => {
-            const result = await converter(i, { responseType: "base64" });
-            if (!result.base64) throw new Error(`Failed page ${i}`);
-            return result;
+        const limit = pLimit(2); 
+        const pageIndices = Array.from({ length: pageCount }, (_, i) => i + 1);
+
+        const tasks = pageIndices.map((i) => {
+            return limit(async () => {
+                // responseType: "base64" is required when using fromBuffer
+                const result = await converter(i, { responseType: "base64" }); 
+                if (!result.base64) throw new Error(`Failed page ${i}`);
+                return result;
+            });
         });
-      });
 
-      const results = await Promise.all(tasks);
+        const results = await Promise.all(tasks);
 
-      if (results.length === 1) {
-        const base64Data = results[0].base64;
-        res.setHeader("Content-Type", `image/${format}`);
-        res.setHeader("Content-Disposition", `attachment; filename="page1.${format}"`);
-        res.send(Buffer.from(base64Data, "base64"));
-      } else {
-        const archive = archiver("zip", { zlib: { level: 1 } });
-        res.setHeader("Content-Type", "application/zip");
-        res.setHeader("Content-Disposition", `attachment; filename="pages.zip"`);
-        archive.pipe(res);
+        // ... (Send images or ZIP logic) ...
+        if (results.length === 1) {
+            const base64Data = results[0].base64;
+            res.setHeader("Content-Type", `image/${format}`);
+            res.setHeader("Content-Disposition", `attachment; filename="page1.${format}"`);
+            res.send(Buffer.from(base64Data, "base64"));
+        } else {
+            const archive = archiver("zip", { zlib: { level: 1 } });
+            res.setHeader("Content-Type", "application/zip");
+            res.setHeader("Content-Disposition", `attachment; filename="pages.zip"`);
+            archive.pipe(res);
 
-        results.forEach((img, i) => {
-          archive.append(Buffer.from(img.base64, "base64"), { name: `page_${i + 1}.${format}` });
-        });
-        await archive.finalize();
-      }
+            results.forEach((img, i) => {
+              archive.append(Buffer.from(img.base64, "base64"), { name: `page_${i + 1}.${format}` });
+            });
+            await archive.finalize();
+        }
 
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: err.message });
+        console.error(err);
+        // If the error happens before cleanupFiles(req.file) is called, 
+        // we clean up the file here just in case.
+        if (filePath) cleanupFiles({ path: filePath }); 
+        res.status(500).json({ error: err.message });
     } finally {
+        // CLEANUP: Only need to delete the output directory now
         try {
             if (fs.existsSync(outputDir)) fs.rmSync(outputDir, { recursive: true, force: true });
-            cleanupFiles(req.file);
-        } catch (e) { console.error("Cleanup error", e); }
+            // cleanupFiles(req.file) is no longer here, preventing the ENOENT error.
+        } catch (e) { console.error("Output cleanup error", e); }
     }
 });
 
