@@ -7,7 +7,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from 'url';
 import pLimit from "p-limit";
-import { fromPath } from "pdf2pic"; // Revert to fromPath (it is more stable)
+import pdfPoppler from "pdf-poppler"; // The new library
+import os from "os";
 
 // Shared imports
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
@@ -16,9 +17,7 @@ import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
-// 1. USE SYSTEM TEMP DIRECTORY FOR UPLOADS (Better for Docker)
-// On Linux/Docker, os.tmpdir() is usually '/tmp'
-import os from "os";
+// USE SYSTEM TEMP DIRECTORY
 const TEMP_DIR = os.tmpdir();
 
 const storage = multer.diskStorage({
@@ -26,7 +25,6 @@ const storage = multer.diskStorage({
     cb(null, TEMP_DIR);
   },
   filename: function (req, file, cb) {
-    // Simple safe filename
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, 'upload-' + uniqueSuffix + path.extname(file.originalname));
   }
@@ -47,18 +45,17 @@ const cleanupFiles = (paths) => {
 };
 
 // --------------------- IMAGE → PDF ---------------------
+// (Your existing code for Image to PDF remains exactly the same)
 app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) return res.status(400).json({ error: "Upload images" });
 
       const pdfDoc = await PDFDocument.create();
-      const limit = pLimit(5); // Reduced concurrency for stability
+      const limit = pLimit(5);
 
       const tasks = req.files.map((file) => {
         return limit(async () => {
-          // Read from disk explicitly only when needed
           const fileBuffer = await fs.promises.readFile(file.path);
-          
           let imageBuffer;
           if (file.mimetype.includes("png")) {
             imageBuffer = await sharp(fileBuffer).png({ compressionLevel: 3 }).toBuffer();
@@ -80,23 +77,22 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
       await addEndlessForgeMetadata(pdfDoc);
       const pdfBytes = await pdfDoc.save();
       
-      // Cleanup uploaded images
-      cleanupFiles(req.files);
+      cleanupFiles(req.files.map(f => f.path));
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="images.pdf"`);
       res.send(Buffer.from(pdfBytes));
 
     } catch (err) {
-      cleanupFiles(req.files); // Ensure cleanup on error
+      if(req.files) cleanupFiles(req.files.map(f => f.path));
       console.error(err);
       res.status(500).json({ error: err.message });
     }
 });
 
-// --------------------- PDF → IMAGE ---------------------
+// --------------------- PDF → IMAGE (REBUILT WITH POPPLER) ---------------------
 app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
-    // Create a unique subfolder in /tmp for this request's outputs
+    // 1. Setup Output Directory
     const requestOutputId = "conversion_" + Date.now();
     const outputDir = path.join(TEMP_DIR, requestOutputId);
     
@@ -105,69 +101,69 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
     try {
         if (!req.file) return res.status(400).json({ error: "Upload a PDF" });
 
-        uploadedFilePath = req.file.path; // This is now in /tmp/upload-....pdf
-
-        const format = (req.body.format || "png").toLowerCase();
-        const dpi = parseInt(req.body.dpi) || 150;
-
+        uploadedFilePath = req.file.path;
+        
         // Ensure output directory exists
         if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-        const options = {
-            density: dpi,
-            format: format === "jpg" ? "jpeg" : format,
-            saveFilename: "page",
-            savePath: outputDir,
-            width: 0, height: 0,
-            graphicsProcess: "gm"
+        const format = (req.body.format || "png").toLowerCase();
+        // pdf-poppler uses 'jpeg' instead of 'jpg'
+        const safeFormat = format === "jpg" ? "jpeg" : format;
+        const dpi = parseInt(req.body.dpi) || 150;
+
+        // 2. Configure Poppler Options
+        const opts = {
+            format: safeFormat,
+            out_dir: outputDir,
+            out_prefix: "page", // Files will be named page-1.png, page-2.png
+            page: null, // Convert ALL pages
+            scale: dpi / 72 // Poppler uses scale factor (72 is default)
         };
 
-        // 1. Initialize converter pointing to the file on disk
-        const converter = fromPath(uploadedFilePath, options);
-        
-        // 2. Load PDF to get page count
-        // Note: loading from disk is memory efficient
-        const pdfBuffer = fs.readFileSync(uploadedFilePath);
-        const pdfDoc = await PDFDocument.load(pdfBuffer);
-        const pageCount = pdfDoc.getPageCount();
+        // 3. Execute Conversion (No Loop Needed! Poppler does it all)
+        await pdfPoppler.convert(uploadedFilePath, opts);
 
-        // 3. CRITICAL: Set Limit to 1 for Free Tier
-        // Rendering PDF to Image is heavy. Doing 2 at once might kill the 512MB RAM.
-        const limit = pLimit(1); 
+        // 4. Read the generated files
+        const files = await fs.promises.readdir(outputDir);
         
-        const pageIndices = Array.from({ length: pageCount }, (_, i) => i + 1);
+        // Filter only valid image files
+        const imageFiles = files.filter(file => file.endsWith(`.${safeFormat}`));
 
-        const tasks = pageIndices.map((i) => {
-            return limit(async () => {
-                // Return base64 so we don't have to read the file back from disk manually
-                const result = await converter(i, { responseType: "base64" });
-                
-                // Detailed error checking
-                if (!result || !result.base64) {
-                    console.error(`Page ${i} failed. Result:`, result);
-                    throw new Error(`Failed to convert page ${i}`);
-                }
-                return result;
-            });
+        if (imageFiles.length === 0) {
+            throw new Error("No images were generated. The PDF might be empty or corrupted.");
+        }
+
+        // 5. SORT FILES NUMERICALLY (Critical Step)
+        // 'page-1.png', 'page-10.png', 'page-2.png' -> We need 1, 2, 10
+        imageFiles.sort((a, b) => {
+            const numA = parseInt(a.match(/-(\d+)\./)[1]);
+            const numB = parseInt(b.match(/-(\d+)\./)[1]);
+            return numA - numB;
         });
 
-        const results = await Promise.all(tasks);
-
-        // ... Response Logic ...
-        if (results.length === 1) {
-            const base64Data = results[0].base64;
-            res.setHeader("Content-Type", `image/${format}`);
+        // 6. Send Response
+        if (imageFiles.length === 1) {
+            // Single Page
+            const filePath = path.join(outputDir, imageFiles[0]);
+            const fileBuffer = await fs.promises.readFile(filePath);
+            
+            res.setHeader("Content-Type", `image/${safeFormat}`);
             res.setHeader("Content-Disposition", `attachment; filename="page1.${format}"`);
-            res.send(Buffer.from(base64Data, "base64"));
+            res.send(fileBuffer);
         } else {
+            // Multiple Pages (ZIP)
             const archive = archiver("zip", { zlib: { level: 1 } });
             res.setHeader("Content-Type", "application/zip");
             res.setHeader("Content-Disposition", `attachment; filename="pages.zip"`);
+            
             archive.pipe(res);
 
-            results.forEach((img, i) => {
-              archive.append(Buffer.from(img.base64, "base64"), { name: `page_${i + 1}.${format}` });
-            });
+            for (const [index, fileName] of imageFiles.entries()) {
+                const filePath = path.join(outputDir, fileName);
+                const fileBuffer = await fs.promises.readFile(filePath);
+                archive.append(fileBuffer, { name: `page_${index + 1}.${format}` });
+            }
+            
             await archive.finalize();
         }
 
@@ -177,10 +173,7 @@ app.post("/pdf/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (re
     } finally {
         // CLEANUP
         try {
-            // Delete the uploaded PDF
             if (uploadedFilePath) cleanupFiles(uploadedFilePath);
-            
-            // Delete the output folder and its contents
             if (fs.existsSync(outputDir)) {
                 fs.rmSync(outputDir, { recursive: true, force: true });
             }
