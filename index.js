@@ -10,13 +10,60 @@ import pLimit from "p-limit";
 import os from "os";
 import {pdf} from "pdf-to-img";
 import { addEndlessForgeMetadata } from "./utils/pdfMetadata.js";
-import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
 import { PDFiumLibrary } from "@hyzyla/pdfium";
+
+/**
+ * Commit V.3.0.0 - 2026-01-09
+ * 
+ * ------------------------------
+ *  PDF(CONVERSION) Microservice
+ * ------------------------------
+ * Features:
+ *  - Pdf to images and viceversa conversions.
+ *  - Secured with HMAC authentication middleware [Added on this commit]
+ * 
+ * 
+ */
+import { verifyInternalKey } from "./shared/apiKeyMiddleware.js";
+import { Readable } from 'stream';
 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const TEMP_DIR = os.tmpdir();
+
+app.use((req, res, next) => {
+  let data = [];
+  req.on('data', chunk => data.push(chunk));
+  req.on('end', () => {
+    const buffer = Buffer.concat(data);
+    req.rawBody = buffer;
+
+    // Checks for ANY content (Files, JSON, etc.)
+    if (req.headers['content-length'] > 0 || req.headers['transfer-encoding']) {
+      const readable = new Readable();
+      readable._read = () => {}; 
+      readable.push(buffer);
+      readable.push(null);
+      
+      Object.assign(readable, {
+        headers: req.headers,
+        method: req.method,
+        url: req.url,
+        rawBody: buffer
+      });
+      
+      req.on = readable.on.bind(readable);
+      req.once = readable.once.bind(readable);
+      req.emit = readable.emit.bind(readable);
+      req.resume = readable.resume.bind(readable);
+      req.pause = readable.pause.bind(readable);
+      req.pipe = readable.pipe.bind(readable);
+      req.unpipe = readable.unpipe.bind(readable);
+    }
+    next();
+  });
+});
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -51,7 +98,7 @@ let pdfium = null;
 
 // --------------------- IMAGE → PDF ---------------------
 // (Your existing code for Image to PDF remains exactly the same)
-app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (req, res) => {
+app.post("/pdf/image-to-pdf", upload.array("images"), verifyInternalKey, async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) return res.status(400).json({ error: "Upload images" });
 
@@ -96,7 +143,7 @@ app.post("/pdf/image-to-pdf", verifyInternalKey, upload.array("images"), async (
 });
 
 // --------------------- PDF → IMAGE (Rewritten with pdf-to-img) ---------------------
-app.post("/pdf/v1/pdf-to-image", verifyInternalKey, upload.single("pdf"), async (req, res) => {
+app.post("/pdf/v1/pdf-to-image", upload.single("pdf"),  verifyInternalKey, async (req, res) => {
     const requestOutputId = "conversion_" + Date.now();
     const outputDir = path.join(TEMP_DIR, requestOutputId);
 
@@ -191,7 +238,7 @@ app.post("/pdf/v1/pdf-to-image", verifyInternalKey, upload.single("pdf"), async 
     }
 });
 
-app.post("/pdf/v2/pdf-to-image/", upload.single("pdf"), async (req, res) => {
+app.post("/pdf/v2/pdf-to-image/", upload.single("pdf"),  verifyInternalKey, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "Upload a PDF file" });
   }
